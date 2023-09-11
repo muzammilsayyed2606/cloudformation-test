@@ -1,0 +1,196 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: ECS Cluster with Auto Scaling, ALB, API Gateway, and ACM Certificate
+
+Parameters:
+  KeyName: 
+    Description: EC2 Key Pair Name
+    Type: AWS::EC2::KeyPair::KeyName
+    ConstraintDescription: Must be the name of an existing EC2 KeyPair.
+  VpcId:
+    Description: ID of the VPC in which to create resources
+    Type: AWS::EC2::VPC::Id
+  SubnetIds:
+    Description: List of subnet IDs for the ECS instances
+    Type: List<AWS::EC2::Subnet::Id>
+
+Resources:
+  ECSCluster:
+    Type: AWS::ECS::Cluster
+
+  ECSClusterAutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      AvailabilityZones: !GetAZs ''
+      LaunchTemplate:
+        LaunchTemplateName: !Ref ECSClusterLaunchTemplate
+      MinSize: 1
+      MaxSize: 3
+      DesiredCapacity: 1
+      VPCZoneIdentifier: !Ref SubnetIds
+      TargetGroupARNs:
+        - !Ref ECSTargetGroup
+
+  ECSClusterLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: ECSClusterLaunchTemplate
+      VersionDescription: Initial version
+      LaunchTemplateData:
+        KeyName: !Ref KeyName
+        SecurityGroups: [!Ref ECSSecurityGroup]
+        InstanceType: t2.micro  # Modify with your desired instance type
+        ImageId: ami-053b0d53c279acc90  # Modify with your desired Amazon Machine Image (AMI) ID
+        UserData:
+          Fn::Base64:
+            Fn::Sub:
+              - |
+                #!/bin/bash -xe
+                # Install and configure ECS agent
+                /bin/bash -c "yum install -y ecs-init"
+                /bin/bash -c "echo ECS_CLUSTER=${ECSClusterName} >> /etc/ecs/ecs.config"
+              - ECSClusterName: !Ref ECSCluster
+
+  ECSTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: ECSTargetGroup
+      Port: 80
+      Protocol: HTTP
+      VpcId: !Ref VpcId
+      TargetType: ip
+
+  ALB:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: ALB
+      Subnets: !Ref SubnetIds
+      SecurityGroups: [!Ref ECSSecurityGroup]
+      Scheme: internet-facing
+      LoadBalancerAttributes:
+        - Key: idle_timeout.timeout_seconds
+          Value: '60'
+      Tags:
+        - Key: Name
+          Value: ALB
+
+  ALBListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+        - Type: fixed-response
+          FixedResponseConfig:
+            ContentType: text/plain
+            StatusCode: 200
+            ContentType: 'text/plain'
+            ResponseBody: 'OK'
+      LoadBalancerArn: !Ref ALB
+      Port: 80
+      Protocol: HTTP
+
+  ECSSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: ECS security group
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - CidrIp: 0.0.0.0/0
+          IpProtocol: -1
+
+  LambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      FunctionName: MyECSIntegrationLambda
+      Code:
+        S3Bucket: tf-state-20223
+        S3Key: lambda/function.zip  # Update with the path to your Lambda deployment package
+      Runtime: nodejs14.x  # Update with your desired runtime
+      Timeout: 30  # Modify as needed
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/AmazonEC2FullAccess  # Permissions for ECS
+
+  ApiGateway:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: MyApiGateway
+
+  ApiGatewayResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      ParentId: !GetAtt ApiGateway.RootResourceId
+      RestApiId: !Ref ApiGateway
+      PathPart: ecs
+
+  ApiGatewayMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      AuthorizationType: NONE
+      HttpMethod: POST
+      ResourceId: !GetAtt ApiGatewayResource.Id
+      RestApiId: !Ref ApiGateway
+      Integration:
+        IntegrationHttpMethod: POST
+        Type: AWS_PROXY
+        Uri:
+          Fn::Sub: arn:aws:apigateway:${AWS::Region}:ecs:path/default
+      MethodResponses:
+        - StatusCode: 200
+
+  ApiGatewayDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn: ApiGatewayMethod
+    Properties:
+      RestApiId: !Ref ApiGateway
+      StageName: prod
+
+  ACMCertificate:
+    Type: AWS::CertificateManager::Certificate
+    Properties:
+      DomainName: muzammilsayyed.com
+      ValidationMethod: DNS
+      DomainValidationOptions:
+        - DomainName: muzammilsayyed.com
+          ValidationDomain: muzammilsayyed.com
+
+  Route53HostedZone:
+    Type: AWS::Route53::HostedZone
+    Properties:
+      Name: muzammilsayyed.com  # Replace with your domain name
+
+  Route53RecordSet:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !Ref Route53HostedZone
+      Name: muzammilsayyed.com  # Replace with your subdomain or domain
+      Type: A
+      AliasTarget:
+        DNSName: !GetAtt ALB.DNSName
+        HostedZoneId: Z2FDTNDATAQYW2  # ALB's DNS zone ID
+
+Outputs:
+  ECSAutoScalingGroup:
+    Description: Auto Scaling group for ECS instances
+    Value: !Ref ECSClusterAutoScalingGroup
+  ECSClusterName:
+    Description: Name of the ECS cluster
+    Value: !Ref ECSCluster
+  ApiGatewayInvokeURL:
+    Description: URL to invoke the API Gateway
+    Value:
+      Fn::Sub: https://${ApiGateway}.execute-api.${AWS::Region}.amazonaws.com/prod/ecs
+  ACMCertificateArn:
+    Description: The ARN of the ACM certificate
+    Value: !Ref ACMCertificate
